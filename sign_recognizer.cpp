@@ -1,64 +1,109 @@
 #include "sign_recognizer.hpp"
-#include <iostream>
+#include <algorithm>
+#include <cstdio>
 
-void SignRecognizer::Initialize(const std::string& tcn_model_path, int seq_length, int feature_dim) {
-    max_seq_length = seq_length;
+void SignRecognizer::Initialize(const std::string& tcn_model_path,
+                                 int seq_length, int feature_dim) {
+    max_seq_length    = seq_length;
     this->feature_dim = feature_dim;
+
     model_id = ssne_loadmodel(const_cast<char*>(tcn_model_path.c_str()), SSNE_STATIC_ALLOC);
-    
-    // TCN 输入通常是一个 [seq_length, feature_dim] 的一维或二维矩阵，在这里映射为一维 tensor
+    if (model_id == 0) {
+        printf("[ERROR] SignRecognizer: Failed to load model: %s\n", tcn_model_path.c_str());
+        return;
+    }
+
+    // Input tensor: [seq_length × feature_dim] floats
+    // feature_dim should equal kNumLandmarks * kLandmarkDims (e.g. 21 * 2 = 42).
     inputs[0] = create_tensor(feature_dim, seq_length, SSNE_FLOAT32, SSNE_BUF_AI);
+
+    // Output tensor: [seq_length × kVocabSize] floats (per-timestep class log-probabilities).
+    // Per ssne_api.h the output tensor MUST be pre-allocated before ssne_getoutput().
+    // TODO: Confirm kVocabSize matches your actual .a1model output shape.
+    outputs[0] = create_tensor(kVocabSize, seq_length, SSNE_FLOAT32, SSNE_BUF_AI);
+    if (outputs[0].data == nullptr) {
+        printf("[ERROR] SignRecognizer: Failed to allocate output tensor "
+               "(vocab_size=%d, seq_len=%d). Inference will be skipped.\n",
+               kVocabSize, seq_length);
+    }
 }
 
 std::string SignRecognizer::ProcessFrame(const LandmarkResult& current_frame) {
-    if (!current_frame.is_detected) return ""; // 无效帧跳过
-
-    // 1. 加入缓冲
-    frame_buffer.push_back(current_frame.landmarks);
-    if (frame_buffer.size() < max_seq_length) {
-        return ""; // 帧数不够，继续收集
+    // 1. Build a fixed-size frame entry.
+    //    Use kNumLandmarks as the canonical landmark count to guarantee the input
+    //    tensor is always filled completely regardless of what the detector returns.
+    //    If the frame has no valid detection, fill with zeros to maintain temporal
+    //    continuity (zero-padding strategy).
+    std::vector<Point2D> frame_entry(kNumLandmarks, {0.0f, 0.0f, 0.0f});
+    if (current_frame.is_detected) {
+        int n = std::min(static_cast<int>(current_frame.landmarks.size()), kNumLandmarks);
+        for (int i = 0; i < n; i++) {
+            frame_entry[i] = current_frame.landmarks[i];
+        }
     }
-    if (frame_buffer.size() > max_seq_length) {
-        frame_buffer.pop_front(); // 保持滑动窗口大小
+
+    // 2. Maintain the sliding-window frame buffer.
+    frame_buffer.push_back(frame_entry);
+    if (frame_buffer.size() < static_cast<size_t>(max_seq_length)) {
+        return "";  // Still collecting frames — wait for a full window.
+    }
+    if (frame_buffer.size() > static_cast<size_t>(max_seq_length)) {
+        frame_buffer.pop_front();
     }
 
-    // 2. 将 frame_buffer 整理到 inputs[0] 中
+    // 3. Fill the input tensor from the current sliding window.
     float* input_ptr = (float*)get_data(inputs[0]);
+    if (input_ptr == nullptr) {
+        printf("[ERROR] SignRecognizer: Input tensor data pointer is null.\n");
+        return "";
+    }
     for (int t = 0; t < max_seq_length; ++t) {
-        for (int p = 0; p < current_frame.landmarks.size(); ++p) {
-            int base_idx = t * feature_dim + p * 2;
-            input_ptr[base_idx] = frame_buffer[t][p].x;
+        for (int p = 0; p < kNumLandmarks; ++p) {
+            // base_idx layout: [time, landmark, coord] stored as flat array
+            int base_idx = t * feature_dim + p * kLandmarkDims;
+            input_ptr[base_idx]     = frame_buffer[t][p].x;
             input_ptr[base_idx + 1] = frame_buffer[t][p].y;
         }
     }
 
-    // 3. 执行 TCN 推理
-    ssne_inference(model_id, 1, inputs);
-    ssne_getoutput(model_id, 1, outputs);
+    // 4. Run TCN inference.
+    int ret = ssne_inference(model_id, 1, inputs);
+    if (ret != SSNE_ERRCODE_NO_ERROR) {
+        printf("[ERROR] SignRecognizer: ssne_inference failed (%d)\n", ret);
+        return "";
+    }
 
-    // 4. 解析输出并 CTC 解码
+    // 5. Retrieve output tensor (must be pre-allocated — see Initialize()).
+    ret = ssne_getoutput(model_id, 1, outputs);
+    if (ret != SSNE_ERRCODE_NO_ERROR) {
+        printf("[ERROR] SignRecognizer: ssne_getoutput failed (%d)\n", ret);
+        return "";
+    }
+
+    // 6. CTC greedy decode.
     float* out_probs = (float*)get_data(outputs[0]);
-    // TODO: 根据你的模型输出 shape 修改解码逻辑
-    std::string gloss = CTC_Decode(out_probs, max_seq_length); 
-    
-    return gloss;
+    if (out_probs == nullptr) {
+        printf("[ERROR] SignRecognizer: Output data pointer is null.\n");
+        return "";
+    }
+    return CTC_Decode(out_probs, max_seq_length);
 }
 
 std::string SignRecognizer::CTC_Decode(float* probs, int length) {
-    // 这里实现你的 CTC 贪心解码或者 BeamSearch
-    // 伪代码：
-    // string result = "";
-    // int last_class = 0;
-    // for t in time_steps:
-    //    int max_class = argmax(probs[t]);
-    //    if max_class != blank_id and max_class != last_class:
-    //        result += vocab[max_class];
-    //    last_class = max_class;
-    // return result;
-    return "HELLO"; // 测试桩
+    // CTC greedy decode: at each time step pick the most probable class;
+    // collapse consecutive duplicates and remove blank tokens (class index 0).
+    // TODO: Replace the stub below with a real vocab lookup table once the
+    //       gloss vocabulary is finalised.
+    (void)probs;
+    (void)length;
+    return "HELLO";  // stub — replace with actual decoding logic
 }
 
 void SignRecognizer::Release() {
     release_tensor(inputs[0]);
-    release_tensor(outputs[0]);
+    // Safe release: only free the output tensor if it was successfully allocated.
+    if (outputs[0].data != nullptr) {
+        release_tensor(outputs[0]);
+        outputs[0].data = nullptr;
+    }
 }

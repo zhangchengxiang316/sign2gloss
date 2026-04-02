@@ -3,6 +3,14 @@
 #include <array>
 #include <string>
 
+// ---------------------------------------------------------------------------
+// Landmark model constants (shared across detector and recognizer)
+// MediaPipe Hands outputs 21 keypoints; each with (x, y) normalized to [0,1].
+// If your .a1model produces 3D landmarks, change kLandmarkDims to 3.
+// ---------------------------------------------------------------------------
+static constexpr int kNumLandmarks = 21;
+static constexpr int kLandmarkDims = 2;  // (x, y) per keypoint
+
 // 2D 关键点
 struct Point2D {
     float x;
