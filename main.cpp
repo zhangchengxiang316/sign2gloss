@@ -49,10 +49,10 @@ int main() {
     camera.Initialize(img_w, img_h, crop_w, crop_h, crop_offset_y);
 
     LandmarkDetector detector;
-    detector.Initialize(mediapipe_path, 256, 256); // 假设 MediaPipe 输入 256x256
+    detector.Initialize(mediapipe_path, 256, 256, crop_w, crop_h); // MediaPipe input 256×256; crop 720×540
 
     SignRecognizer recognizer;
-    recognizer.Initialize(tcn_path, 30, 42); // 假设序列长30帧，特征维度42(21点*2)
+    recognizer.Initialize(tcn_path, 30, kNumLandmarks * kLandmarkDims); // 30-frame window; 21×2 = 42 features
 
     Visualizer visualizer;
     visualizer.Initialize(img_w, img_h);
