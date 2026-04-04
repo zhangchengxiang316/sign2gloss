@@ -1,71 +1,109 @@
 #include "visualizer.hpp"
 #include <cmath>
+#include <algorithm>
 
 void Visualizer::Initialize(int img_w, int img_h) {
     osd_device.Initialize(img_w, img_h);
 }
 
-// 核心：把两点之间的线段，变成一个有宽度的矩形（四边形）
-sst::device::osd::OsdQuadRangle Visualizer::LineToQuadrangle(Point2D p1, Point2D p2, int thickness, int color) {
-    sst::device::osd::OsdQuadRangle q;
+sst::device::osd::OsdQuadRangle Visualizer::LineToQuadSolid(Point2D p1, Point2D p2,
+                                                            int thickness, int color) {
+    using namespace sst::device::osd;
+
+    OsdQuadRangle q;
+    q.shape_type = OsdShapeType::VERTEX;
     q.color = color;
     q.alpha = fdevice::TYPE_ALPHA75;
-    q.type = fdevice::TYPE_SOLID; // 实心四边形充当线段
+    q.type  = fdevice::TYPE_SOLID;  // solid line
     q.border = 0;
 
-    // 计算法向量
     float dx = p2.x - p1.x;
     float dy = p2.y - p1.y;
     float len = std::sqrt(dx * dx + dy * dy);
-    
-    if (len < 1e-3) return q;
 
-    float nx = -dy / len * (thickness / 2.0f);
-    float ny = dx / len * (thickness / 2.0f);
+    // If too short, still draw a tiny square-ish quad
+    if (len < 1e-3f) {
+        float half = thickness * 0.5f;
+        int x0 = (int)std::round(p1.x - half);
+        int y0 = (int)std::round(p1.y - half);
+        int x1 = (int)std::round(p1.x + half);
+        int y1 = (int)std::round(p1.y + half);
 
-    // 四边形的四个顶点 (基于 OSD device 中 box 的特殊存储方式，这里退化为矩形边界)
-    // 注意：OSD demo中的 OsdQuadRangle.box 是 [xmin, ymin, xmax, ymax]，如果是斜线，
-    // 原生 osd_device 需要修改以支持真正任意四个点。如果 OSD 只支持正交框，下面为包围盒：
-    q.box = {
-        std::min(p1.x, p2.x) - thickness, 
-        std::min(p1.y, p2.y) - thickness, 
-        std::max(p1.x, p2.x) + thickness, 
-        std::max(p1.y, p2.y) + thickness
-    };
-    
+        q.vertex_out.points[0] = {x0, y0};
+        q.vertex_out.points[1] = {x0, y1};
+        q.vertex_out.points[2] = {x1, y1};
+        q.vertex_out.points[3] = {x1, y0};
+        q.vertex_in = q.vertex_out;
+        return q;
+    }
+
+    // Unit normal vector scaled by half thickness
+    float half = thickness * 0.5f;
+    float nx = -dy / len * half;
+    float ny =  dx / len * half;
+
+    // Outer quad vertices (convex, thin rectangle around the segment)
+    // A = p1 + n
+    // B = p2 + n
+    // C = p2 - n
+    // D = p1 - n
+    int ax = (int)std::round(p1.x + nx);
+    int ay = (int)std::round(p1.y + ny);
+    int bx = (int)std::round(p2.x + nx);
+    int by = (int)std::round(p2.y + ny);
+    int cx = (int)std::round(p2.x - nx);
+    int cy = (int)std::round(p2.y - ny);
+    int dx2 = (int)std::round(p1.x - nx);
+    int dy2 = (int)std::round(p1.y - ny);
+
+    q.vertex_out.points[0] = {ax, ay};
+    q.vertex_out.points[1] = {bx, by};
+    q.vertex_out.points[2] = {cx, cy};
+    q.vertex_out.points[3] = {dx2, dy2};
+
+    // For solid quadrangle, set vertex_in equal to vertex_out (implementation-friendly)
+    q.vertex_in = q.vertex_out;
+
     return q;
 }
 
-void Visualizer::DrawSkeleton(const LandmarkResult& result, const std::vector<SkeletonConnection>& connections, int offset_y) {
-    if (!result.is_detected) {
+void Visualizer::DrawSkeleton(const LandmarkResult& result,
+                              const std::vector<SkeletonConnection>& connections,
+                              int offset_y) {
+    if (clear_each_frame_) {
         Clear();
+    }
+
+    if (!result.is_detected) {
         return;
     }
 
     std::vector<sst::device::osd::OsdQuadRangle> quads;
+    quads.reserve(connections.size());
 
     for (const auto& conn : connections) {
         int idx1 = conn.first;
         int idx2 = conn.second;
 
-        if (idx1 < result.landmarks.size() && idx2 < result.landmarks.size()) {
-            Point2D p1 = result.landmarks[idx1];
-            Point2D p2 = result.landmarks[idx2];
-            
-            // 加上裁剪的偏移量，回到原图坐标系
-            p1.y += offset_y;
-            p2.y += offset_y;
+        if (idx1 < 0 || idx2 < 0) continue;
+        if ((size_t)idx1 >= result.landmarks.size() || (size_t)idx2 >= result.landmarks.size()) continue;
 
-            quads.push_back(LineToQuadrangle(p1, p2, 4, 2)); // 线宽4，颜色索引2
-        }
+        Point2D p1 = result.landmarks[idx1];
+        Point2D p2 = result.landmarks[idx2];
+
+        // crop -> original image coordinate (only y offset in your crop strategy)
+        p1.y += offset_y;
+        p2.y += offset_y;
+
+        // draw thin solid line
+        quads.push_back(LineToQuadSolid(p1, p2, line_thickness_, /*color=*/2));
     }
 
     osd_device.Draw(quads);
 }
 
 void Visualizer::Clear() {
-    std::vector<sst::device::osd::OsdQuadRangle> empty;
-    osd_device.Draw(empty);
+    osd_device.ClearAll();
 }
 
 void Visualizer::Release() {
